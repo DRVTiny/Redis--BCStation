@@ -2,21 +2,20 @@ package Redis::BCStation;
 use 5.16.1;
 use Carp qw(confess croak);
 use Mojo::Redis2;
+use Log::Log4perl;
+use Log::Log4perl::Level;
 use Log::Dispatch;
-use Scalar::Util qw(refaddr);
+use Scalar::Util qw(refaddr blessed);
 use Data::Dumper;
 
 sub __redcon {
     my $conpar=shift;
-    $conpar
-            ? eval {
-                {
-                 'HASH'  => sub { Mojo::Redis2->new(%{$_[0]}) },
-                 'Mojo::Redis2' => sub { $_[0] },
-                 ''      => sub { Mojo::Redis2->new('url'=>$_[0]) },
-                }->{ref $conpar}->($conpar)
-              }
-            : Mojo::Redis2->new,
+    ($conpar && eval {{
+                       'HASH'  => sub { Mojo::Redis2->new(%{$_[0]}) },
+                       'Mojo::Redis2' => sub { $_[0] },
+                       ''      => sub { Mojo::Redis2->new('url'=>lc(substr $_[0],0,6) eq 'redis:'?$_[0]:'redis://'.$_[0]) },
+                    }->{ref $conpar}->($conpar)}
+    ) || Mojo::Redis2->new();
 }
 
 sub __xtopic() {
@@ -41,6 +40,27 @@ sub new {
     }
     confess('You must specify BCStation name') unless $stationName and ! ref($stationName);
     confess('BCStation name must not contain symbol ":"') if index($stationName,':')>=0;
+    my $logger=sub {
+        my $L=shift;
+        ($L and ref($L) and blessed($L) and !(grep !$L->can($_), qw/debug info warn error fatal/))
+            ? $L
+            : Log::Log4perl->initialized()
+                ? Log::Log4perl::get_logger(__PACKAGE__)
+                : do {
+                    say STDERR __PACKAGE__.': Your logger is not suitable for me, RTFM please :)' if $L;
+                    my %LOGCONF=('category'=>__PACKAGE__=~s/::/./gr);
+                    Log::Log4perl::init(\(<<'EOLOGCONF'=~s/\{\{([^}]+)\}\}/$LOGCONF{lc($1)}/gr))
+log4perl.category.{{CATEGORY}}           =      DEBUG, Screen
+
+log4perl.appender.Screen                 =      Log::Log4perl::Appender::Screen
+log4perl.appender.Screen.stderr          =      1
+log4perl.appender.Screen.layout          =      Log::Log4perl::Layout::PatternLayout
+log4perl.appender.Screen.layout.ConversionPattern = %d{HH:mm:ss} | %d{dd.MM.yyyy} | %P | %p | %m%n
+EOLOGCONF
+                        ? Log::Log4perl->get_logger(__PACKAGE__)
+                        : Log::Dispatch->new('outputs'=>[['Screen','min_level' => 'debug', 'newline' => 1, 'stderr' => 1]])
+                };
+    }->($pars{'logger'});
     my %props;
     %props=(
         'name'=>{'val'=>$stationName},
@@ -51,7 +71,7 @@ sub new {
         },
         'debug'=>{'val'=>$pars{'debug'}?1:0},
         'subscribers'=>{'val'=>{}},
-        'logger'=>{'val'=>Log::Dispatch->new('outputs'=>[['Screen','min_level' => 'debug', 'newline' => 1, 'stderr' => 1]])},
+        'logger'=>{'val'=>$logger},
         'hasMethod'=>{
             'val'=>sub {
                 shift if ref $_[0];
@@ -76,7 +96,6 @@ sub new {
 sub publish {
     my ($slf, $topic, $msg)=@_;
     do { $msg=$topic; $topic='other' } unless $msg;
-
     my $xtopic=$slf->__xtopic($topic);
     $slf->logger->debug(sprintf q(BCStation publishes: {topic: "%s", message: "%s"}), $xtopic, $msg);
     $slf->('redc')->publish($xtopic, $msg);
@@ -98,13 +117,7 @@ sub subscribe {
     unless (%{$subs}) {
         $subs->{$xtopic}{refaddr $handler}=$handler;
         $redc->on('message'=>sub {
-            my $r=shift;
-#            my ($r, $msg, $chan)=@_;
-            use bytes;
-            my $msg=shift;
-            say STDERR 'submsg hex: ', unpack('H*', $msg);
-            no bytes;
-            my $chan=shift;
+            my ($r, $msg, $chan)=@_;
             my $chanSubs=$subs->{$chan};
             return unless ref($chanSubs) eq 'HASH' and %{$chanSubs};
             $_->($msg,$chan) for values %{$chanSubs};
@@ -117,8 +130,9 @@ sub subscribe {
 }
 
 sub AUTOLOAD {
-    my $slf=$_[0];
     our $AUTOLOAD;
+    my $slf=$_[0];
+#    say '>>>> ',ref($slf),' <<<< ', $AUTOLOAD;
     return unless my ($method)=$AUTOLOAD=~/::(\w+)$/;
     return unless $slf->('hasMethod'=>$method);
     {

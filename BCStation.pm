@@ -11,6 +11,10 @@ use Log::Dispatch;
 use Scalar::Util qw(refaddr blessed);
 #use JSON::XS;
 use Data::Dumper;
+use constant {
+    KEEP_ALIVE_SCHED_RUN_AFTER=>30,
+    KEEP_ALIVE_SCHED_INTERVAL=>10,
+};
 
 my $callerLvl=0;
 
@@ -83,20 +87,36 @@ EOLOGCONF
     my %aeh;
     %props=(
         'name'=>{		'val'=>$stationName, 		'acl'=>'r'  },
+        'client' =>{
+            'val'=>sub { 
+                state $clientName;
+                shift if ref $_[0] eq __PACKAGE__;
+                if (!defined($clientName) or (defined($_[0]) and ! ref($_[0]) and ($clientName ne $_[0]))) {
+                    $redc->client->name(                        
+                        $clientName=(defined($_[0]) and ! ref($_[0]))?$_[0]:($pars{'client'} // $$),
+                        (@_ and ref($_[$#_]) eq 'CODE')?($_[$#_]):()
+                    )
+                }
+                $clientName
+            }, 
+            'acl'=>'rw' 
+        },
         'topic_format'=>{ 	'val'=>'%s<<%s>>', 		'acl'=>'r'  },
         'redc'=>{		'val'=>$redc, 			'acl'=>'-'  },
         'redis'=>{		'val'=>$pars{'redis'}, 		'acl'=>'r'  },
-        'keepAlive'=>{
+        'keep_alive'=>{
             'val'=>sub {
                 state $flKeepAlive=0;
-                return $flKeepAlive unless defined(my $newVal=shift);
-                return if (my $newVal=shift)==$flKeepAlive;
-                do {
-                    undef $aeh{'keep_alive_timer'}; return 1
-                } unless $newVal;
+                shift if ref $_[0] eq __PACKAGE__;
+                return $flKeepAlive unless @_;
+                $logger->logdie('Keep-alive flag value must be simple scalar, not reference') if ref $_[0];
+                # Nothing changes - nothing to do - return old (still actual) value.
+                return $flKeepAlive if (my $newVal=shift)==$flKeepAlive;
+                # Remove periodically scheduller if keep-alive value is "falsish" (i.e. 0 or undef)
+                undef($aeh{'keep_alive_timer'}), return($newVal) unless $newVal;
                 $aeh{'keep_alive_timer'}=AnyEvent->timer(
-                    'after'=>30,
-                    'interval'=>10,
+                    'after'=>KEEP_ALIVE_SCHED_RUN_AFTER,
+                    'interval'=>KEEP_ALIVE_SCHED_INTERVAL,
                     'cb'=>sub {
                         $redCastObj->('redc')->ping(sub {
                            my ($redO,$err,$res)=@_;
@@ -160,6 +180,7 @@ EOLOGCONF
                         : do { $methodProps->{'val'}=shift }
                     : $methodProps->{'val'};
     }, ( ref($class) || $class );
+    $pars{'client'}//=$$;
     $redCastObj->($_, $pars{$_}) for grep exists($props{$_}), keys %pars;
     return $redCastObj
 }
@@ -178,7 +199,7 @@ sub reconnect {
     my $redc=$slf->redc(__redcon($slf->('redis')) || $log->logdie($_[0] || 'Failed to re-establish my connection to Redis server'));
     
     do {
-        $log->debug('No subscriptions defined yet, so we dont need to restore anything. Its a friday-evening, Luke!');
+        $log->debug(q|No subscriptions defined yet, so we dont need to restore anything. It's a friday-evening, Luke!|);
         return 1
     } unless my %subs=%{$slf->subscribers};
     
@@ -205,7 +226,7 @@ sub reconnect {
         }
     );
     my $doFinally=sub { $flReconInProgress=0 }; 
-    $reconDelay->on('error'=>$doFinally);
+    $reconDelay->on('error'=>sub { $log->error('Error in Mojo::IOLoop->delay while resubscribing to Redis channels'); $doFinally->() });
     $reconDelay->on('finish'=>$doFinally);
 }
 

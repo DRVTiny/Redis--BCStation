@@ -1,6 +1,12 @@
 package Redis::BCStation;
+
+use Carp qw(confess croak cluck);
+BEGIN {
+    $SIG{__WARN__}=\&Carp::cluck;
+}
+
 use 5.16.1;
-use Carp qw(confess croak);
+
 use EV;
 use AnyEvent;
 use Mojo::Redis2;
@@ -14,9 +20,14 @@ use Data::Dumper;
 use constant {
     KEEP_ALIVE_SCHED_RUN_AFTER=>30,
     KEEP_ALIVE_SCHED_INTERVAL=>10,
+    DFLT_MAX_PUB_RETRIES=>20,
+    MAX_MSG_LENGTH_TO_SHOW=>128,
 };
 
 my $callerLvl=0;
+my $flReconInProgress;
+my $cntQueUnPubNxtId=0;
+my %queUnPub;
 
 sub __redcon {
     my $conpar=shift;
@@ -132,6 +143,57 @@ EOLOGCONF
             },
             'acl'=>'rw'
         },
+        'max_pub_retries'=>{
+            'val'=>sub {
+                my $slf=shift;
+                state $nMaxRetries=DFLT_MAX_PUB_RETRIES;
+                return $nMaxRetries unless @_;
+                my $n=shift;
+                confess "max_pub_retries ($n) is invalid" unless ! ref($n) and defined($n) and length($n) and $n !~ m/[^\d]/;
+                $nMaxRetries=$n
+            },
+            'acl'=>'rw',
+        },
+        'check_unpub'=>{
+            'val'=>sub {
+                return $aeh{'check_unpub'} if $aeh{'check_unpub'};
+                Mojo::IOLoop->timer(0.5=>sub {
+                    $aeh{'check_unpub'}=Mojo::IOLoop->recurring(0.1 =>
+                    sub {
+                        return if $flReconInProgress;
+                        my $log=$redCastObj->('logger');
+                        my $redc=$redCastObj->('redc');
+                        my $retries=$redCastObj->('max_pub_retries');
+                        my $reconDelay=Mojo::IOLoop->delay(
+                            sub {
+                                $redc->ping($_[0]->begin)
+                            },
+                            sub {
+                                my ($delay,$err,$res)=@_;
+                                $log->warn('(unpub) Redis ping error: ',$err), return if $err;
+                                $log->trace('(unpub) Redis ping OK');
+                                for my $umi (sort keys %queUnPub) {
+                                    $redc->publish(@{$queUnPub{$umi}}[1,2] => sub {
+                                        unless ($_[1]) {
+                                            my $x=delete($queUnPub{$umi});
+                                            $log->debug(sprintf '(unpub) Succesfully published message <<%s>> on channel [%s] with UMI=%d', $x->[2], $x->[1], $umi);
+                                            return
+                                        }
+                                        my $n=++$queUnPub{$umi}[0];
+                                        if ($retries and $n>$retries) {
+                                            $log->error(sprintf 'Cant publish message #%s after %d retries, purging it from the queue', $umi, $n);
+                                            delete $queUnPub{$umi}
+                                        }
+                                    })
+                                }  
+                            },
+                        );   
+                    }) # <- recurring ("interval")
+                }); # <- timer ("after")
+                    
+            },
+            'acl'=>'-',
+        },
         'debug'=>{		'val'=>$pars{'debug'}?1:0, 	'acl'=>'rw' },
         'subscribers'=>{	'val'=>{},			'acl'=>'-'  },
         'logger'=>{
@@ -182,11 +244,12 @@ EOLOGCONF
     }, ( ref($class) || $class );
     $pars{'client'}//=$$;
     $redCastObj->($_, $pars{$_}) for grep exists($props{$_}), keys %pars;
+    $redCastObj->('check_unpub');
     return $redCastObj
 }
 
 sub reconnect {
-    state $flReconInProgress;
+#    state $flReconInProgress;
     my $slf=shift;
     my $log=$slf->logger;
     
@@ -230,12 +293,35 @@ sub reconnect {
     $reconDelay->on('finish'=>$doFinally);
 }
 
+sub __add2unpub {
+    $queUnPub{my $umi=$cntQueUnPubNxtId++}=[1,$_[0],$_[1]];
+    $umi;
+}
+
+sub __cut {
+    length($_[0])<=MAX_MSG_LENGTH_TO_SHOW ? $_[0] : substr($_[0],0,MAX_MSG_LENGTH_TO_SHOW - 3).'...'
+}
+
 sub publish {
     my ($slf, $topic, $msg)=@_;
     do { $msg=$topic; $topic='other' } unless $msg;
     my $xtopic=$slf->__xtopic($topic);
-    $slf->logger->debug(sprintf q(BCStation publishes: {topic: "%s", message: "%s"}), $xtopic, $msg);
-    $slf->('redc')->publish($xtopic, $msg);
+    
+     if ($flReconInProgress) {
+         my $umi=__add2unpub($xtopic => $msg);
+         $slf->logger->debug(sprintf 'Reconnection is in progress, we have to drop message <<%s>> to the "unpub" queue as #%d', __cut($msg), $umi);
+         return;
+    }
+    
+    $slf->('redc')->publish($xtopic, $msg, sub {
+        if (my $err=$_[1]) {
+            my $umi=__add2unpub($xtopic => $msg);
+            $slf->logger->warn(sprintf 'Fail to publish message on channel [%s]. Reason: <<%s>>. Queued to "unpub" as %d', $xtopic, __cut($err), $umi);
+        } else {
+            $slf->logger->debug(sprintf q(BCStation publishes: {topic:"%s",message:{length:%d,data:"%s"}), $xtopic, length($msg), __cut($msg));
+        }
+        
+    } );
 }
 
 sub subscribe {

@@ -14,8 +14,8 @@ use Log::Log4perl;
 use Log::Log4perl::Level;
 use Log::Dispatch;
 use Scalar::Util qw(refaddr blessed);
-#use JSON::XS;
 use Data::Dumper;
+
 use constant {
     KEEP_ALIVE_SCHED_RUN_AFTER	=>	3, 	# sec.
     KEEP_ALIVE_SCHED_INTERVAL	=>	4, 	# sec.
@@ -28,9 +28,6 @@ use constant {
 };
 
 my $callerLvl=0;
-my $flReconInProgress;
-
-
 
 sub new {
     my $class=shift;

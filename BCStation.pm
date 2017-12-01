@@ -8,7 +8,6 @@ BEGIN {
 use 5.16.1;
 
 use EV;
-use AnyEvent;
 use Mojo::Redis2;
 use Mojo::IOLoop;
 use Log::Log4perl;
@@ -18,37 +17,20 @@ use Scalar::Util qw(refaddr blessed);
 #use JSON::XS;
 use Data::Dumper;
 use constant {
-    KEEP_ALIVE_SCHED_RUN_AFTER=>30,
-    KEEP_ALIVE_SCHED_INTERVAL=>10,
-    DFLT_MAX_PUB_RETRIES=>20,
-    MAX_MSG_LENGTH_TO_SHOW=>128,
+    KEEP_ALIVE_SCHED_RUN_AFTER	=>	3, 	# sec.
+    KEEP_ALIVE_SCHED_INTERVAL	=>	4, 	# sec.
+    FIRST_UNPUB_CHECK_AFTER	=>	0.1, 	# sec.
+    CHECK_UNPUB_EVERY		=>	0.2,	# sec.
+    DFLT_MAX_PUB_RETRIES	=>	20,
+    MAX_MSG_LENGTH_TO_SHOW	=>	128,
+    UPUB_XTOPIC_I    		=>	1,
+    UPUB_MSG_I			=>	2,
 };
 
 my $callerLvl=0;
 my $flReconInProgress;
-my $cntQueUnPubNxtId=0;
-my %queUnPub;
 
-sub __redcon {
-    my $conpar=shift;
-    ($conpar && eval {{
-                       'HASH'  => sub { Mojo::Redis2->new(%{$_[0]}) },
-                       'Mojo::Redis2' => sub { $_[0] },
-                       ''      => sub { Mojo::Redis2->new('url'=>lc(substr $_[0],0,6) eq 'redis:'?$_[0]:'redis://'.$_[0]) },
-                    }->{ref $conpar}->($conpar)}
-    ) || Mojo::Redis2->new();
-}
 
-sub __xtopic {
-    my ($slf, $topic)=@_;
-    return sprintf($slf->('topic_format'), $slf->('name'), $topic)
-}
-
-sub __check_logger {
-    shift while ref($_[0]) eq __PACKAGE__;
-    my $L=shift;
-    return ($L and ref($L) and blessed($L) and !(grep !$L->can($_), qw/debug info warn error fatal logdie/))
-}
 
 sub new {
     my $class=shift;
@@ -94,8 +76,11 @@ EOLOGCONF
         my ($R, $err)=@_;
         $logger->logdie('Very-Big-Trouble: Mojo::Redis2 operational error: ',$err);
     });
-    # AnyEvent handlers
+    # Event handlers
     my %aeh;
+    my %queUnPub;
+    my $cntQueUnPubNxtId=0;
+    my $flReconInProgress;    
     %props=(
         'name'=>{		'val'=>$stationName, 		'acl'=>'r'  },
         'client' =>{
@@ -120,29 +105,78 @@ EOLOGCONF
                 state $flKeepAlive=0;
                 shift if ref $_[0] eq __PACKAGE__;
                 return $flKeepAlive unless @_;
-                $logger->logdie('Keep-alive flag value must be simple scalar, not reference') if ref $_[0];
+                my $log=$redCastObj->('logger');
+                $log->logdie('Keep-alive flag value must be simple scalar, not reference') if ref $_[0];
                 # Nothing changes - nothing to do - return old (still actual) value.
                 return $flKeepAlive if (my $newVal=shift)==$flKeepAlive;
                 # Remove periodically scheduller if keep-alive value is "falsish" (i.e. 0 or undef)
                 undef($aeh{'keep_alive_timer'}), return($newVal) unless $newVal;
-                $aeh{'keep_alive_timer'}=AnyEvent->timer(
-                    'after'=>KEEP_ALIVE_SCHED_RUN_AFTER,
-                    'interval'=>KEEP_ALIVE_SCHED_INTERVAL,
-                    'cb'=>sub {
-                        $redCastObj->('redc')->ping(sub {
-                           my ($redO,$err,$res)=@_;
-#                           $logger->debug(join(', '=>map $_.'='.do{ my $t=eval("\$$_"); ref($t)?JSON::XS->new->encode($t):$t }, qw/err res/));
-                           if ($err || $res ne 'PONG') {
-                               $redCastObj->reconnect('Failed to re-animate Redis connection after ping lost');
-                           } else {
-                               $logger->debug('Mojo::Redis2 PING returned status: OK');
-                           }
+                Mojo::IOLoop->delay(
+                    sub {
+                        Mojo::IOLoop->timer(KEEP_ALIVE_SCHED_RUN_AFTER() => $_[0]->begin);
+                    }, # <- set one-time alarm
+                    sub {
+                        $aeh{'keep_alive_timer'}=
+                        Mojo::IOLoop->recurring(KEEP_ALIVE_SCHED_INTERVAL() => sub {
+                            $redCastObj->('redc')->ping(sub {
+                               my ($redO,$err,$res)=@_;
+                               if ($err || $res ne 'PONG') {
+                                   $redCastObj->reconnect('(keep_alive) failed to re-animate Redis connection after ping lost');
+                               } else {
+                                   $log->debug('(keep_alive) PING returned status: OK');
+                               }
+                            });
                         });
-                    }
-                );
+                    }, # <- set recurring timer
+                ); # <- $loop->delay()
             },
             'acl'=>'rw'
         },
+        'reconnect'=>{
+            'val'=>sub {
+                my $slf=shift;
+                my $log=$slf->logger;
+                # We use localized variable here (instead of normal object method) because veriable can guarantee atomicity in simple increment operation (avoiding possible race conditions)
+                if ($flReconInProgress++) {
+                    $log->debug('Cant reconnect: reconnection already is in progress');
+                    return
+                }
+
+                $slf->redc->DESTROY;
+                my $redc=$slf->redc(__redcon($slf->('redis')) || $log->logdie($_[0] || 'Failed to re-establish connection to Redis server'));
+                my %subs=eval { %{$slf->subscribers} }
+                    or $log->debug('No subscriptions defined yet, so we dont need to restore anything. Its friday-evening, Luke!'), return(1);
+                
+                my @chans=keys %subs;
+                my $reconDelay=
+                Mojo::IOLoop->delay(
+                    sub {
+                        $redc->ping($_[0]->begin)
+                    },
+                    sub {
+                        my ($delay, $err, $res)=@_;
+                        $log->logdie('(resub) Redis ping error: ',$err) if $err;
+                        $log->debug('(resub) Redis ping result: ', $res);
+                        $redc->subscribe(\@chans, $delay->begin);
+                    },
+                    sub {
+                        my ($delay, $err, $res)=@_;
+                        my $sChans='( '.join(', '=>@chans).' )';
+                        if ($err) {
+                            $log->logdie(sprintf '%s: ERROR when resubscribing to channels %s on reconnect: %s', __PACKAGE__, $sChans, $err);
+                            return
+                        }
+                        $log->info(sprintf 'Succesfully resubscribed to channels %s', $sChans);
+
+                        $redc->on('message'=>$slf->('on_message')->{'hndl'});
+                    }
+                );
+                my $doFinally=sub { $flReconInProgress=0 }; 
+                $reconDelay->on('error'=>sub { $log->error('Error in Mojo::IOLoop->delay while resubscribing to Redis channels'); $doFinally->() });
+                $reconDelay->on('finish'=>$doFinally);
+            },
+            'acl'=>'r',
+        }, # <- reconnect()
         'max_pub_retries'=>{
             'val'=>sub {
                 my $slf=shift;
@@ -154,52 +188,73 @@ EOLOGCONF
             },
             'acl'=>'rw',
         },
-        'check_unpub'=>{
-            'val'=>sub {
-                return $aeh{'check_unpub'} if $aeh{'check_unpub'};
-                Mojo::IOLoop->timer(0.5=>sub {
-                    $aeh{'check_unpub'}=Mojo::IOLoop->recurring(0.1 =>
+        'add_unpub'=>{
+            'val'=>sub{
+                my $flWasEmpty=! %queUnPub;
+                $queUnPub{my $umi=$cntQueUnPubNxtId++}=[1,$_[1],$_[2]];
+                return $umi unless $flWasEmpty;
+                my $slf=$_[0];
+                $slf->logger->debug('Unpublished queue is not empty (again). Setting "publishing" watcher');
+                Mojo::IOLoop->delay(
                     sub {
-                        return if $flReconInProgress;
-                        my $log=$redCastObj->('logger');
-                        my $redc=$redCastObj->('redc');
-                        my $retries=$redCastObj->('max_pub_retries');
-                        my $reconDelay=Mojo::IOLoop->delay(
-                            sub {
-                                $redc->ping($_[0]->begin)
-                            },
-                            sub {
-                                my ($delay,$err,$res)=@_;
-                                $log->warn('(unpub) Redis ping error: ',$err), return if $err;
-                                $log->trace('(unpub) Redis ping OK');
-                                for my $umi (sort keys %queUnPub) {
-                                    $redc->publish(@{$queUnPub{$umi}}[1,2] => sub {
-                                        unless ($_[1]) {
-                                            my $x=delete($queUnPub{$umi});
-                                            $log->debug(sprintf '(unpub) Succesfully published message <<%s>> on channel [%s] with UMI=%d', $x->[2], $x->[1], $umi);
-                                            return
-                                        }
-                                        my $n=++$queUnPub{$umi}[0];
-                                        if ($retries and $n>$retries) {
-                                            $log->error(sprintf 'Cant publish message #%s after %d retries, purging it from the queue', $umi, $n);
-                                            delete $queUnPub{$umi}
-                                        }
-                                    })
-                                }  
-                            },
-                        );   
-                    }) # <- recurring ("interval")
-                }); # <- timer ("after")
-                    
+                        $aeh{'check_unpub'}=Mojo::IOLoop->timer(FIRST_UNPUB_CHECK_AFTER() => $_[0]->begin)
+                    }, # <- one-time alarm ("after" in AE)
+                    sub {
+                        sub {
+                            state $cntRun=0;
+                            $cntRun++ or 
+                                $aeh{'check_unpub'}=
+                                Mojo::IOLoop->recurring(CHECK_UNPUB_EVERY() =>__SUB__);
+                            my $log=$slf->('logger');
+                            $flReconInProgress and $log->debug('Cant check "unpublished" queue: reconnection is in progress'), return;
+                            my $redc=$slf->('redc');
+                            my $retries=$slf->('max_pub_retries');
+                            Mojo::IOLoop->delay(
+                                sub {
+                                    $redc->ping($_[0]->begin)
+                                },
+                                sub {
+                                    my ($delay,$err,$res)=@_;
+                                    $log->warn('(unpub) Redis ping error: ',join(', '=>$err,$res)), return if $err or $res ne 'PONG';
+                                    $log->trace('(unpub) Redis ping OK');
+                                    for my $umi (sort keys %queUnPub) {
+                                        $redc->publish(@{$queUnPub{$umi}}[UPUB_XTOPIC_I , UPUB_MSG_I] => sub {
+                                            # If message from unpub queue was published (no errors occured in $_[1])...
+                                            unless ($_[1]) {
+                                                my $x=$slf->del_unpub($umi);
+                                                $log->debug(sprintf '(unpub) Succesfully published message <<%s>> on channel [%s] with UMI=%d', $x->[2], $x->[1], $umi);
+                                                return
+                                            }
+                                            my $n=++$queUnPub{$umi}[0];
+                                            if ($retries and $n>$retries) {
+                                                $log->error(sprintf 'Cant publish message #%s after %d retries, purging it from the queue', $umi, $n);
+                                                $slf->del_unpub($umi);
+                                            }
+                                        }) # <-  redc->publish
+                                    } # <- for every unpublished message (TODO: what if we cant publish first message? do we really must to attempt publish rest messages? hmm...)
+                                }, 
+                            );  # <- loop->delay
+                        }->()
+                    }, # <- recurring timer ("interval" in AE)
+                ); # <- ioloop->delay
+                return $umi
             },
             'acl'=>'-',
-        },
+        }, # <- add_unpub()
+        'del_unpub'=>{
+            'val'=>sub {
+                my $unpubElement=delete $queUnPub{$_[1]};
+                Mojo::IOLoop->remove(delete $aeh{'check_unpub'}) unless %queUnPub or !$aeh{'check_unpub'};
+                return $unpubElement;
+            },
+            'acl'=>'-',
+        }, # <- del_unpub()
         'debug'=>{		'val'=>$pars{'debug'}?1:0, 	'acl'=>'rw' },
         'subscribers'=>{	'val'=>{},			'acl'=>'-'  },
         'logger'=>{
             'val'=>$logger,
             'chk'=>\&__check_logger,
-            'acl'=>'w'
+            'acl'=>'rw'
         },
         'hasMethod'=>{
             'val'=>sub {
@@ -217,10 +272,10 @@ EOLOGCONF
         },
         'on_message'=>{
             'val'=>{'hndl'=>sub {
-                my ($r, $msg, $chan)=@_;
-                my $chanSubs=$redCastObj->subscribers->{$chan};
-                return unless ref($chanSubs) eq 'HASH' and %{$chanSubs};
-                $_->($msg,$chan) for values %{$chanSubs};
+                my ($r, $message, $xtopic)=@_;
+                $_->($message => $xtopic) for values do {
+                    ($_=eval { $redCastObj->subscribers->{$xtopic} } and ref($_) eq 'HASH' and %{$_} and $_) or {}
+                };
             }},
             'acl'=>'-'
         },
@@ -244,63 +299,8 @@ EOLOGCONF
     }, ( ref($class) || $class );
     $pars{'client'}//=$$;
     $redCastObj->($_, $pars{$_}) for grep exists($props{$_}), keys %pars;
-    $redCastObj->('check_unpub');
     return $redCastObj
-}
-
-sub reconnect {
-#    state $flReconInProgress;
-    my $slf=shift;
-    my $log=$slf->logger;
-    
-    if ($flReconInProgress++) {
-        $log->debug('Cant reconnect: reconnection already is in progress');
-        return
-    }
-
-    $slf->redc->DESTROY;
-    my $redc=$slf->redc(__redcon($slf->('redis')) || $log->logdie($_[0] || 'Failed to re-establish my connection to Redis server'));
-    
-    do {
-        $log->debug(q|No subscriptions defined yet, so we dont need to restore anything. It's a friday-evening, Luke!|);
-        return 1
-    } unless my %subs=%{$slf->subscribers};
-    
-    my @chans=keys %subs;
-    my $reconDelay=Mojo::IOLoop->delay(
-        sub {
-            $redc->ping($_[0]->begin)
-        },
-        sub {
-            my ($delay,$err,$res)=@_;
-            $log->logdie('(resub) Redis ping error: ',$err) if $err;
-            $log->debug('(resub) Redis ping result: ', $res);
-            $redc->subscribe([@chans], $delay->begin);
-        },
-        sub {
-            my ($delay,$err,$res)=@_;
-            my $sChans='( '.join(', '=>@chans).' )';
-            if ($err) {
-                $log->logdie(sprintf '%s: ERROR when resubscribing to channels %s on reconnect: %s', __PACKAGE__, $sChans, $err);
-                return
-            }
-            $log->info(sprintf 'Succesfully resubscribed to channels %s', $sChans);
-            $redc->on('message'=>$slf->('on_message')->{'hndl'});
-        }
-    );
-    my $doFinally=sub { $flReconInProgress=0 }; 
-    $reconDelay->on('error'=>sub { $log->error('Error in Mojo::IOLoop->delay while resubscribing to Redis channels'); $doFinally->() });
-    $reconDelay->on('finish'=>$doFinally);
-}
-
-sub __add2unpub {
-    $queUnPub{my $umi=$cntQueUnPubNxtId++}=[1,$_[0],$_[1]];
-    $umi;
-}
-
-sub __cut {
-    length($_[0])<=MAX_MSG_LENGTH_TO_SHOW ? $_[0] : substr($_[0],0,MAX_MSG_LENGTH_TO_SHOW - 3).'...'
-}
+} # <- constructor aka NEW
 
 sub publish {
     my ($slf, $topic, $msg)=@_;
@@ -308,21 +308,21 @@ sub publish {
     my $xtopic=$slf->__xtopic($topic);
     
      if ($flReconInProgress) {
-         my $umi=__add2unpub($xtopic => $msg);
+         my $umi=$slf->add_unpub($xtopic => $msg);
          $slf->logger->debug(sprintf 'Reconnection is in progress, we have to drop message <<%s>> to the "unpub" queue as #%d', __cut($msg), $umi);
          return;
     }
     
     $slf->('redc')->publish($xtopic, $msg, sub {
         if (my $err=$_[1]) {
-            my $umi=__add2unpub($xtopic => $msg);
+            my $umi=$slf->add_unpub($xtopic => $msg);
             $slf->logger->warn(sprintf 'Fail to publish message on channel [%s]. Reason: <<%s>>. Queued to "unpub" as %d', $xtopic, __cut($err), $umi);
         } else {
-            $slf->logger->debug(sprintf q(BCStation publishes: {topic:"%s",message:{length:%d,data:"%s"}), $xtopic, length($msg), __cut($msg));
+            $slf->logger->debug(sprintf 'BCStation publishes: {topic:"%s",message:{length:%d,data:"%s"}', $xtopic, length($msg), __cut($msg));
         }
         
     } );
-}
+} # <- publish()
 
 sub subscribe {
     my ($slf, $topic, $hndl_on_msg, $opt_hndl_on_subs_status, $fl_opt_hndl_is_delbeg)=@_;
@@ -330,12 +330,12 @@ sub subscribe {
     my $xtopic=$slf->__xtopic($topic);
     my $log=$slf->logger;
     $log->logdie('You must pass sub {} as a second parameter for subscirbe method!')
-        unless ref($hndl_on_msg) eq 'CODE';
-#    { open my $fh, '>>/tmp/redis_sub.log'; printf $fh "[%s] %s\n", $$, ref($log) }
+        unless $hndl_on_msg and ref($hndl_on_msg) eq 'CODE';
     $log->info('Requested subscribe for ',$xtopic);;
     my $redc=$slf->('redc');
-    my $subs=$slf->('subscribers');
-    unless ( ref($subs) eq 'HASH' and %{$subs} and $subs->{$xtopic} ) {
+    my $listeners=$slf->('subscribers');
+    my $flHasListeners=ref($listeners) eq 'HASH' && %{$listeners};
+    unless ( $flHasListeners and $listeners->{$xtopic} ) {
         Mojo::IOLoop->delay(
             sub {
                 $redc->ping($_[0]->begin)
@@ -365,15 +365,14 @@ sub subscribe {
             }
         );
     }
-    unless (%{$subs}) {
-        $subs->{$xtopic}{refaddr $hndl_on_msg}=$hndl_on_msg;
-        $redc->on('message'=>$slf->('on_message')->{'hndl'})
-    } elsif ($subs->{$xtopic}{refaddr $hndl_on_msg}) {
-        $log->error('Passed callback already subscribed to << ',$topic,' >>');
-    } else {
-        $subs->{$xtopic}{refaddr $hndl_on_msg}=$hndl_on_msg;
-    }
-}
+    my $psubHndlOnMsg=refaddr($hndl_on_msg);
+    
+    $log->error('Passed callback already subscribed to << ',$topic,' >>'), return 
+        if $flHasListeners and $listeners->{$xtopic}{$psubHndlOnMsg};
+    
+    $listeners->{$xtopic}{$psubHndlOnMsg}=$hndl_on_msg;
+    $redc->on('message'=>$slf->('on_message')->{'hndl'}) unless $flHasListeners;
+} # <- subscribe()
 
 sub AUTOLOAD {
     our $AUTOLOAD;
@@ -397,6 +396,32 @@ sub DESTROY {
     my $slf=shift;
     $callerLvl=0;
     $slf->('redc')->DESTROY();
+}
+
+###################################### FOOTER #############################################
+sub __redcon {
+    my $conpar=shift;
+    ($conpar && eval {{
+                       'HASH'  => sub { Mojo::Redis2->new(%{$_[0]}) },
+                       'Mojo::Redis2' => sub { $_[0] },
+                       ''      => sub { Mojo::Redis2->new('url'=>lc(substr $_[0],0,6) eq 'redis:'?$_[0]:'redis://'.$_[0]) },
+                    }->{ref $conpar}->($conpar)}
+    ) || Mojo::Redis2->new();
+}
+
+sub __xtopic {
+    my ($slf, $topic)=@_;
+    return sprintf($slf->('topic_format'), $slf->('name'), $topic)
+}
+
+sub __check_logger {
+    shift while ref($_[0]) eq __PACKAGE__;
+    my $L=shift;
+    return ($L and ref($L) and blessed($L) and !(grep !$L->can($_), qw/debug info warn error fatal logdie/))
+}
+
+sub __cut {
+    length($_[0])<=MAX_MSG_LENGTH_TO_SHOW ? $_[0] : substr($_[0],0,MAX_MSG_LENGTH_TO_SHOW - 3).'...'
 }
 
 1;

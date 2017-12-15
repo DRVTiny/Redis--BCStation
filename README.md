@@ -1,4 +1,4 @@
-== WHAT IS IT ==
+# WHAT IS IT
 
 Redis::BCStation is a broadcasting radio station... oh no, it is a package to subscribe 
 on and publish to channels of the some "virtual broadcasting station"
@@ -12,10 +12,12 @@ With this package, you can listen on channel with the same name, but on
 different "stations" - data published on those channels will be different
 too:
 
+```perl
 my $bcstTokyo = Redis::BCStation('tokyo');
 my $bcstMoscow = Redis::BCStation('moscow');
 $bcstTokyo->subscribe('weather', sub { say @_ } );
 $bcstMoscow->subscribe('weather', sub { say @_ } );
+```
 
 ...it is obvious that the weather forecast in Tokyo and Moscow will be  different :)
 

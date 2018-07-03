@@ -17,7 +17,6 @@ use Log::Log4perl qw(:easy);
 use Log::Log4perl::Level;
 use Log::Dispatch;
 use Scalar::Util qw(refaddr blessed looks_like_number);
-use JSON::XS;
 use Data::Dumper;
 use constant {
     KEEP_ALIVE_SCHED_RUN_AFTER	=>	 3, 	# sec.
@@ -57,20 +56,21 @@ sub new {
     my $class = shift;
     my ($stationName, %pars) = (undef,());
     
-    if (scalar(@_) > 1) {
-        if ( scalar(@_) & 1 ) {
-            $stationName=shift;
-            %pars=@_
+    if ($#_ >= 1) {
+        if ( $#_ & 1 ) {
+            %pars = @_;
+            $stationName = $pars{'name'}
         } else {
-            %pars=@_;
-            $stationName=$pars{'name'}
+            $stationName = shift;
+            %pars = @_
         }
     } else {
-        $stationName=shift;
+        $stationName = shift
     }
-    confess('You must specify BCStation name') unless $stationName and ! ref($stationName);
+    ( $stationName and ! ref($stationName) )
+        or confess('You must specify BCStation name');
     # because "gladiolous"? :)
-    confess('BCStation name must not contain symbol ":"') if index($stationName, ':') >= 0;
+    index($stationName, ':') >= 0 and confess('BCStation name must not contain symbol ":"');
     my $hostName = $ENV{'HOSTNAME'} // hostfqdn;
     my $logger = sub {
         my $L=shift;
@@ -85,14 +85,13 @@ sub new {
                         ? Log::Log4perl->get_logger(__PACKAGE__)
                         : Log::Dispatch->new('outputs'=>[['Screen','min_level' => 'debug', 'newline' => 1, 'stderr' => 1]])
                 };
-    }->($pars{'logger'});
+    }->($pars{'logger'}) or confess('Cant get logger and cant prepare it myself. No log - no work!');
     my (%props, $redCastObj);
     my (%aeh, $flReconInProgress);
     my $redc = __redcon($pars{'redis'}) or $logger->logdie('Failed to establish connection to Redis');
     
     # Event handlers
-    my ($cntQueUnPubNxtId, %queUnPub) = (0);
-    my @queAfterRecon;
+    my (%queUnPub, @queAfterRecon);
     %props = (
         'name'			 => { 'val' => $stationName, 	'acl' => 'r'  	},
         'fast_but_binary_unsafe' => { 'val' => sub { 
@@ -288,48 +287,43 @@ sub new {
                     'after' 	=> FIRST_UNPUB_CHECK_AFTER,
                     'interval'	=> CHECK_UNPUB_EVERY,
                     'cb'	=> sub {
-                        try { # to be removed
-                            if ( $mutexRepub++ ) {
-                                $mutexRepub--;
-                                $slf->log_warn('(unpub) republisher already running? ', $mutexRepub);
-                                return
-                            }
-                            
-                            if (! %queUnPub and $aeh{'check_unpub'}) {
-                                Mojo::IOLoop->remove(delete $aeh{'check_unpub'});
-                                $slf->log_debug('(unpub) unpublished queue is empty, republishing task was removed from evloop');
-                                return $mutexRepub--
-                            }
-                            
-                            if ( $flReconInProgress or !defined($slf->redc) ) {
-                                $slf->log_debug('(unpub) cant check "unpublished" queue: reconnection is in progress');
-                                return $mutexRepub--
-                            }
-#                            $slf->log_debug('(unpub) queUnPub=', Dumper(\%queUnPub));
-                            
-                            for my $umi (sort keys %queUnPub) {
-                                my $pubpack = delete $queUnPub{$umi};
-                                $slf->redc->publish( $pubpack->[UPUB_XTOPIC_I] => ${$pubpack->[UPUB_MSG_I]},
-                                sub {
-                                    # If message from unpub queue was published (error message in $_[1] is absent)...
-                                    unless ( $_[1] ) {
-                                        $slf->log_debug(sprintf '(unpub) succesfully published message <<%s>> (%d bytes) delayed as UMI=%s on channel [%s]', __cut(${$pubpack->[UPUB_MSG_I]}), length(${$pubpack->[UPUB_MSG_I]}), $umi, $pubpack->[UPUB_XTOPIC_I]);
-                                        return
-                                    }
-                                    $slf->log_error('(unpub) error when publishing delayed msg#%s <<%s>>: %s', $umi, __cut(${$pubpack->[UPUB_MSG_I]}), $_[1]);
-                                    my $n = ++($queUnPub{$umi} = $pubpack)->[UPUB_FAILCNT_I];
-                                    my $nMaxPubRetries = $slf->('max_pub_retries');
-                                    if ($nMaxPubRetries and $n > $nMaxPubRetries) {
-                                        $slf->log_error(sprintf '(unpub) cant publish delayed msg#%s after %d retries, so we have to wipe it out from the queue', $umi, $n);
-                                        $slf->del_unpub( $umi );
-                                    }
-                                }) # <-  redc->publish
-                                
-                            } # <- for every unpublished message (TODO: what if we cant publish first message? do we really must to attempt publish rest messages? hmm...)
+                        if ( $mutexRepub++ ) {
                             $mutexRepub--;
-                        } catch { # to be removed
-                            say STDERR "************************************ ( $_ ) **************************************";
-                        }; # to be removed
+                            $slf->log_warn('(unpub) republisher already running? ', $mutexRepub);
+                            return
+                        }
+                        
+                        if (! %queUnPub and $aeh{'check_unpub'}) {
+                            Mojo::IOLoop->remove(delete $aeh{'check_unpub'});
+                            $slf->log_debug('(unpub) unpublished queue is empty, republishing task was removed from evloop');
+                            return $mutexRepub--
+                        }
+                        
+                        if ( $flReconInProgress or !defined($slf->redc) ) {
+                            $slf->log_debug('(unpub) cant check "unpublished" queue: reconnection is in progress');
+                            return $mutexRepub--
+                        }
+                        
+                        for my $umi (sort keys %queUnPub) {
+                            my $pubpack = delete $queUnPub{$umi};
+                            $slf->redc->publish( $pubpack->[UPUB_XTOPIC_I] => ${$pubpack->[UPUB_MSG_I]},
+                            sub {
+                                # If message from unpub queue was published (error message in $_[1] is absent)...
+                                unless ( $_[1] ) {
+                                    $slf->log_debug(sprintf '(unpub) succesfully published message <<%s>> (%d bytes) delayed as UMI=%s on channel [%s]', __cut(${$pubpack->[UPUB_MSG_I]}), length(${$pubpack->[UPUB_MSG_I]}), $umi, $pubpack->[UPUB_XTOPIC_I]);
+                                    return
+                                }
+                                $slf->log_error('(unpub) error when publishing delayed msg#%s <<%s>>: %s', $umi, __cut(${$pubpack->[UPUB_MSG_I]}), $_[1]);
+                                my $n = ++($queUnPub{$umi} = $pubpack)->[UPUB_FAILCNT_I];
+                                my $nMaxPubRetries = $slf->('max_pub_retries');
+                                if ($nMaxPubRetries and $n > $nMaxPubRetries) {
+                                    $slf->log_error(sprintf '(unpub) cant publish delayed msg#%s after %d retries, so we have to wipe it out from the queue', $umi, $n);
+                                    $slf->del_unpub( $umi );
+                                }
+                            }) # <-  redc->publish
+                            
+                        } # <- for every unpublished message (TODO: what if we cant publish first message? do we really must to attempt publish rest messages? hmm...)
+                        $mutexRepub--;
                     });
                 return $umi
             },

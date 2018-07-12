@@ -7,22 +7,23 @@ use Carp qw(confess croak cluck);
 use 5.16.1;
 use English;
 use subs qw/__get_timer_settings __not_empty_arref __cut/;
-use Ref::Util qw(is_plain_coderef is_plain_arrayref is_plain_hashref);
+use Ref::Util qw(is_plain_coderef is_plain_arrayref is_plain_hashref is_plain_scalarref);
 use EV;
 use Try::Tiny;
+use Time::HiRes qw(time);
 use Net::Domain qw(hostfqdn);
 use Mojo::Redis2;
 use Mojo::IOLoop;
 use Log::Log4perl qw(:easy);
 use Log::Log4perl::Level;
 use Log::Dispatch;
-use Scalar::Util qw(refaddr blessed looks_like_number);
+use Scalar::Util qw(weaken refaddr blessed looks_like_number);
 use Data::Dumper;
 use constant {
     KEEP_ALIVE_SCHED_RUN_AFTER	=>	 3, 	# sec.
     KEEP_ALIVE_SCHED_INTERVAL	=>	 4, 	# sec.
-    FIRST_UNPUB_CHECK_AFTER	=>	 0.1, 	# sec.
-    CHECK_UNPUB_EVERY		=>	 0.2,	# sec.
+    FIRST_UNPUB_CHECK_AFTER	=>	 0.2, 	# sec.
+    CHECK_UNPUB_EVERY		=>	 0.3,	# sec.
     DFLT_MAX_PUB_RETRIES	=>	 20,
     MAX_MSG_LENGTH_TO_SHOW	=>	 128,
     UPUB_FAILCNT_I		=>	 0,
@@ -36,7 +37,12 @@ use constant {
     DFLT_RECON_AFTER		=>	0.05,
     TRUE			=>	1,
     FALSE			=>	undef,
-    DONE			=>      1,
+};
+
+use constant {
+    YES => TRUE,
+    NO  => FALSE,
+    DONE => TRUE,
 };
 
 BEGIN {
@@ -50,6 +56,8 @@ BEGIN {
 EOCODE
     }
 }
+
+select(STDERR); $|=1; select(STDOUT); $|=1;
 
 my $callerLvl = 0;
 sub new {
@@ -86,12 +94,17 @@ sub new {
                         : Log::Dispatch->new('outputs'=>[['Screen','min_level' => 'debug', 'newline' => 1, 'stderr' => 1]])
                 };
     }->($pars{'logger'}) or confess('Cant get logger and cant prepare it myself. No log - no work!');
-    my (%props, $redCastObj);
-    my (%aeh, $flReconInProgress);
-    my $redc = __redcon($pars{'redis'}) or $logger->logdie('Failed to establish connection to Redis');
+    my (%props, %aeh, %queUnPub, $redCastObj);
     
-    # Event handlers
-    my (%queUnPub, @queAfterRecon);
+    my $redc = __redcon( $pars{'redis'} ) // $logger->logdie('Failed to establish connection to Redis');
+    
+    my $tsStartRecon;
+    my $reconot = Redis::BCStation::Reconotify->new;    
+    $reconot->on('we_are_reconnecting' => sub { $tsStartRecon = time() });
+    $reconot->on('we_was_reconnected'  => sub { 
+        $_[1]->log_debug(sprintf 'Reconnected within %s sec.', time() - $tsStartRecon) 
+    });
+    
     %props = (
         'name'			 => { 'val' => $stationName, 	'acl' => 'r'  	},
         'fast_but_binary_unsafe' => { 'val' => sub { 
@@ -99,16 +112,15 @@ sub new {
                                           return $flFastButUnsafe unless $#_ > 0;
                                           my $slf = shift;
                                           __is_boolean($_[0], \my $flNewFastButUnsafe)
-                                              or $slf->log_logdie('fast-but-binary-unsafe option value is incorrect');
+                                              or $slf->log_logdie('fast-but-binary-unsafe option value is incorrect (must be boolean)');
                                           if ( defined($flNewFastButUnsafe) xor defined($flFastButUnsafe) ) {
                                               $flFastButUnsafe = $flNewFastButUnsafe;
-                                              $slf->redc->protocol_class('Protocol::Redis' . ($flNewFastButUnsafe ? '::XS' : ''))
+                                              $redc->protocol_class('Protocol::Redis' . ($flNewFastButUnsafe ? '::XS' : ''))
                                           }
                                           return DONE
                                       },
                                       'acl' => 'rw'
                                     },
-        'reconnecting'  => {	'val' => sub { $flReconInProgress }, 	'acl' => '-' 	},
         'clientid' 	=> {
             'val' => sub {
                 state $clientName;
@@ -127,30 +139,34 @@ sub new {
             },
             'acl'=>'rw' 
         },
-        'topic_format'	=> {	'val'=>'%s<<%s>>',	 'acl'=>'r'  },
-        'redc'		=> {	'val' => $redc, 	 'acl'=>'-'  },
-        'redis' 	=> {	'val' => $pars{'redis'}, 'acl'=>'r'  },
+        'topic_format'	=> {	'val' => '%s<<%s>>',	 'acl' => 'r'  },
+        'redc'		=> {	'val' => $redc,
+                                'acl' => 'r'  
+                           },
+        'redis' 	=> {	'val' => $pars{'redis'}, 'acl' => 'r'  },
         'keep_alive' 	=> {
             'val' => sub {
                 state $keepAliveTimings;
                 my $slf = shift;
                 
                 return wantarray ? @{$keepAliveTimings} : [@{$keepAliveTimings}] unless @_;
-                
-                unless (defined($_[0]) and $_[0]) {
+                my $flKAIsBoolean = __is_boolean($_[0], \my $flKeepAlive);
+                if ($flKAIsBoolean and ! $flKeepAlive) {
                     Mojo::IOLoop->remove(delete $aeh{'keep_alive_timer'}) if defined $aeh{'keep_alive_timer'};
                     $slf->log_debug('keep_alive was disabled');
                     return
                 }
-                
                 my $dfltTimings = $keepAliveTimings // [KEEP_ALIVE_SCHED_RUN_AFTER, KEEP_ALIVE_SCHED_INTERVAL];
                 my @oldTimings = $keepAliveTimings ? @{$keepAliveTimings} : ();
-                $keepAliveTimings =
-                    ( ! ref($_[0]) and (looks_like_number($_[0]) ? $_[0] : ($_[0] =~ m/^(?:true|on|y)/i) ) )
+                
+                $keepAliveTimings = eval {
+                    ( is_plain_arrayref($_[0]) or (! ref($_[0]) and (looks_like_number($_[0]) or index($_[0], ':') >= 0)) )
+                    ? __get_timer_settings($_[0], $dfltTimings) // die
+                    : $flKeepAlive
                         ? $dfltTimings
-                        : __get_timer_settings($_[0], $dfltTimings)
-                            || $slf->log_logdie('Keep-alive settings must be "[after:]interval" string or ref to the list containing maximum 2 numeric elements');
-                            
+                        : die
+                } or $slf->log_logdie('Keep-alive settings must be "[after:]interval" string or ref to the list containing maximum 2 numeric elements');
+                $slf->log_debug("will use the following keep-alive timings: @{$keepAliveTimings}");
                 return TRUE if $aeh{'keep_alive_timer'} and @oldTimings and $oldTimings[0] == $keepAliveTimings->[0] and $oldTimings[1] == $keepAliveTimings->[1];
                 
                 Mojo::IOLoop->remove(delete $aeh{'keep_alive_timer'}) if $aeh{'keep_alive_timer'};
@@ -159,7 +175,7 @@ sub new {
                     'after'	=> $keepAliveTimings->[TIMER_OPT_AFTER],
                     'interval'	=> $keepAliveTimings->[TIMER_OPT_INTERVAL],
                     'cb'	=> sub {
-                        $slf->redc->ping(sub {
+                        $redc->ping(sub {
                            my ($redO, $err, $res)=@_;
                            if ($err || $res ne 'PONG') {
                                $slf->log_error(sprintf '(keep_alive) PING FAILED <<%s>>, lets try to reconnect immediately', join('', grep defined($_), $err, $res));
@@ -173,30 +189,37 @@ sub new {
             },
             'acl' => 'rw'
         }, # <- keep_alive()
+        'reconot'	  => { 'val' => $reconot, 'acl' => '-' },
         'reconnect_after' => { 'val' => DFLT_RECON_AFTER, 	'acl' => 'rw', 	'chk' => \&__is_pos_number	},
         'reconnect_every' => { 'val' => DFLT_RECON_INTERVAL, 	'acl' => 'rw', 	'chk' => \&__is_pos_number	},
         'reconnect' => {
             'val' => sub {
                 my ($slf, %opt) = @_;
-                push @queAfterRecon, __not_empty_arref( $opt{'on_success'} );
+                $reconot->once('we_was_reconnected' => $_) for grep is_plain_coderef($_), __not_empty_arref( $opt{'on_success'} );
                 # We use localized variable here (instead of normal object method) because veriable can guarantee atomicity in simple increment operation (avoiding possible race conditions)
-                if ($flReconInProgress++) {
+                if ( $slf->reconnecting(1) ) {
                     $slf->log_debug('Cant reconnect: reconnection already is in progress');
                     return
                 }
+                
+                undef( $redc );
+                
+                $reconot->once('we_was_reconnected' => sub { $slf->has_unpublished and $slf->try_to_repub });
+                $reconot->we_are_reconnecting();
                 my $afterDelay = $opt{'afterDelay'} // $slf->reconnect_after;
                 my $retryEvery = $opt{'retryEvery'} // $slf->reconnect_every;
-                $slf->redc->DESTROY;
+                $slf->log_debug('Reconnection is in progress, please, be patient');
                 my $nReconRetries = 1;
                 my $doReconnect = sub {
-                    my $redc =
+                    $slf->log_debug('in $doReconnect->()');
+                    $redc =
                     try {
-                        $slf->redc( __redcon( $pars{'redis'} ) ) or die;
+                        __redcon( $pars{'redis'} ) or die;
                     } catch {
                         $slf->log_warn(sprintf 'Reconnection failed after %d retr%s', $nReconRetries, ($nReconRetries == 1 ? 'y' : 'ies'));
                         if ( $nReconRetries++ > DFLT_RECON_RETRIES_COUNT ) {
                             $aeh{'try2recon'} and Mojo::IOLoop->remove(delete $aeh{'try2recon'});
-                            $flReconInProgress = FALSE;
+                            $slf->reconnecting(0);
                             $slf->log_logdie(sprintf 'Failed to re-establish connection to Redis server: reconnection retries count exceeds limit (%d tries)', $nReconRetries);
                         }
                         undef
@@ -205,22 +228,14 @@ sub new {
                         $aeh{'try2recon'} //= Mojo::IOLoop->recurring($retryEvery => __SUB__);
                         return
                     }
-                    $aeh{'try2recon'} and Mojo::IOLoop->remove(delete $aeh{'try2recon'});
-                    $redc->on('error' => $slf->on_error->{'hndl'});
+                    weaken($props{'redc'}{'val'} = $redc);
+                    $slf->log_debug(sprintf 'After reconnect REDC #%s', refaddr $redc);
                     $slf->resubscribe(sub {
-                        if ( @queAfterRecon ) {
-                            my %alreadyDone;
-                            while (defined(my $doAfterRecon = shift @queAfterRecon)) {
-                                next if $alreadyDone{refaddr $doAfterRecon->[0]}++;
-                                $doAfterRecon->[0]->(@{$doAfterRecon}[1..$#{$doAfterRecon}])
-                            }
-                            @queAfterRecon = ();
-
-                        }
-                        $flReconInProgress = FALSE;
-                        $slf->log_info('Reconnection succesful');
-                        
-                    });
+                        $aeh{'try2recon'} and Mojo::IOLoop->remove(delete $aeh{'try2recon'});
+                        $redc->on('error' => $slf->on_error->{'hndl'});
+                        $slf->reconnecting(0);
+                        $reconot->we_was_reconnected($slf);
+                    })->resolve;
                 };
                 defined($afterDelay) && looks_like_number($afterDelay) && ($afterDelay > 0)
                     ? Mojo::IOLoop->timer($afterDelay => $doReconnect)
@@ -243,16 +258,16 @@ sub new {
                 my $resubDelay = $slf->__ping_and_exec(
                     'name' => q<resubscribing to Redis channels>,
                     'exec' 	 => sub {
-                        $slf->redc->subscribe(\@chans, $_[1])
+                        $redc->subscribe(\@chans, $_[1])
                     },
                     'on_success' => sub {
-                        $slf->redc->on('message' => $slf->('on_message')->{'hndl'});
+                        $redc->on('message' => $slf->('on_message')->{'hndl'});
                         $slf->log_info(sprintf 'Succesfully resubscribed to channels: %s', join(', ' => @chans));
                     },
                     'on_error'  => sub {
                         $slf->log_error(sprintf 'Failed to resubscribe to channels <<%s>>. Reason: %s', join(', ' => @chans), ${$_[1]});
                     },
-                    is_plain_coderef( $doFinally ) ? ('on_finish' => $doFinally) : (),
+                    is_plain_coderef( $doFinally ) ? ('finally' => $doFinally) : (),
                 );
             },
             'acl' => 'r',
@@ -275,55 +290,92 @@ sub new {
             },
             'acl' => '-'
         },
-        'add_unpub'=>{
+        'has_unpublished' => {
+            'val' => sub { %queUnPub + 0 }, 'acl' => 'r'
+        },
+        'republishing' => {
             'val' => sub {
-                my $flWasEmpty = ! %queUnPub;
+                state $flRepublishing = 0;
+                defined($_[0])
+                    ? 
+                        $_[0] ? $flRepublishing++ : ($flRepublishing = 0)
+                    :   $flRepublishing
+            },
+            'acl' => '-',
+            '!slf' => 1,
+        },
+        'reconnecting' => {
+            'val' => sub {
+                state $flReconnecting = 0;
+                defined($_[0])
+                    ? 
+                        $_[0] ? $flReconnecting++ : ($flReconnecting = 0)
+                    :   $flReconnecting
+            },
+            'acl' => '-',
+            '!slf' => 1,
+        },        
+        'try_to_repub' => {
+            'val' => sub {
+                my $slf = $_[0];
+                if ( $slf->republishing(1) ) {
+                    $slf->log_debug('republisher already running');
+                    return
+                }
+                try {
+                    for my $umi (sort keys %queUnPub) {
+                        my $pubpack = delete $queUnPub{$umi};
+                        $redc->publish( $pubpack->[UPUB_XTOPIC_I] => ${$pubpack->[UPUB_MSG_I]},
+                        sub {
+                            # If message from unpub queue was published (error message in $_[1] is absent)...
+                            unless ( $_[1] ) {
+                                $slf->log_debug(
+                                    sprintf '(unpub) succesfully published message #%s <<%s>> (%d bytes) on channel [%s]', 
+                                            $umi, __cut($pubpack->[UPUB_MSG_I]), length(${$pubpack->[UPUB_MSG_I]}), $pubpack->[UPUB_XTOPIC_I]
+                                );
+                                return
+                            }
+                            if (++$pubpack->[UPUB_FAILCNT_I] > $slf->max_pub_retries) {
+                                $slf->log_error(sprintf '(unpub) delayed message #%s was finally rejected: number of retries exceeds maximum (%d)', $umi, $slf->max_pub_retries);
+                            } else {
+                                # return message back to the unpub queue
+                                $queUnPub{$umi} = $pubpack;
+                                $slf->log_error('(unpub) error when republishing delayed message #%s: %s', $umi, $_[1]);
+                            }
+                        }) # <-  redc->publish
+                    } # <- for every unpublished message (TODO: what if we cant publish first message? do we really must attempt to publish rest messages? hmm...)
+                } catch {
+                    $slf->log_error('when trying to republish: ', $_);
+                } finally {
+                    $slf->republishing(0);
+                };
+            },
+            'acl' => '-',
+        },
+        'add_unpub' => {
+            'val' => sub {
                 my ($slf, $umi) = @_[0, 1];
+                my $flWasEmpty = ! $slf->has_unpublished;
+                $slf->log_debug('in add_unpub()');
                 @{$queUnPub{$umi}}[0, UPUB_XTOPIC_I, UPUB_MSG_I] = (1, @_[2, 3]);
                 return $umi unless $flWasEmpty;
-                $slf->log_debug('Unpublished queue is not empty (again). Setting up "republisher" schedulling');
+                $slf->log_debug('(unpub) Unpublished queue is not empty. Setting up "republisher" job schedulling');
                 my $mutexRepub = 0;
                 __set_timer(\$aeh{'check_unpub'},
                     'after' 	=> FIRST_UNPUB_CHECK_AFTER,
                     'interval'	=> CHECK_UNPUB_EVERY,
                     'cb'	=> sub {
                         if ( $mutexRepub++ ) {
-                            $mutexRepub--;
-                            $slf->log_warn('(unpub) republisher already running? ', $mutexRepub);
-                            return
-                        }
-                        
-                        if (! %queUnPub and $aeh{'check_unpub'}) {
+                            $slf->log_info('(unpub) republisher was already launched? exiting...');
+                        } elsif (! $slf->has_unpublished and $aeh{'check_unpub'} ) {
                             Mojo::IOLoop->remove(delete $aeh{'check_unpub'});
-                            $slf->log_debug('(unpub) unpublished queue is empty, republishing task was removed from evloop');
-                            return $mutexRepub--
+                            $slf->log_debug('(unpub) unpub_queue is empty. Republishing task was removed from scheduller');
+                        } elsif ( $slf->reconnecting or !defined( $redc ) ) {
+                            $slf->log_info('(unpub) cant check "unpublished" queue: reconnection is in progress');
+                        } else {
+                            $slf->try_to_repub;
                         }
-                        
-                        if ( $flReconInProgress or !defined($slf->redc) ) {
-                            $slf->log_debug('(unpub) cant check "unpublished" queue: reconnection is in progress');
-                            return $mutexRepub--
-                        }
-                        
-                        for my $umi (sort keys %queUnPub) {
-                            my $pubpack = delete $queUnPub{$umi};
-                            $slf->redc->publish( $pubpack->[UPUB_XTOPIC_I] => ${$pubpack->[UPUB_MSG_I]},
-                            sub {
-                                # If message from unpub queue was published (error message in $_[1] is absent)...
-                                unless ( $_[1] ) {
-                                    $slf->log_debug(sprintf '(unpub) succesfully published message <<%s>> (%d bytes) delayed as UMI=%s on channel [%s]', __cut(${$pubpack->[UPUB_MSG_I]}), length(${$pubpack->[UPUB_MSG_I]}), $umi, $pubpack->[UPUB_XTOPIC_I]);
-                                    return
-                                }
-                                $slf->log_error('(unpub) error when publishing delayed msg#%s <<%s>>: %s', $umi, __cut(${$pubpack->[UPUB_MSG_I]}), $_[1]);
-                                my $n = ++($queUnPub{$umi} = $pubpack)->[UPUB_FAILCNT_I];
-                                my $nMaxPubRetries = $slf->('max_pub_retries');
-                                if ($nMaxPubRetries and $n > $nMaxPubRetries) {
-                                    $slf->log_error(sprintf '(unpub) cant publish delayed msg#%s after %d retries, so we have to wipe it out from the queue', $umi, $n);
-                                    $slf->del_unpub( $umi );
-                                }
-                            }) # <-  redc->publish
-                            
-                        } # <- for every unpublished message (TODO: what if we cant publish first message? do we really must to attempt publish rest messages? hmm...)
-                        $mutexRepub--;
+                        $mutexRepub = 0;
                     });
                 return $umi
             },
@@ -344,7 +396,7 @@ sub new {
             'chk'	=>	\&__check_logger,
             'acl'	=>	'rw'
         },
-        'hasMethod'=>{
+        'has_method'=>{
             'val'=>sub {
                 shift if ref $_[0];
                 return unless $_[0] and !ref($_[0]);
@@ -362,6 +414,7 @@ sub new {
             'val' => {
                 'hndl' => sub {
                     my ($r, $message, $xtopic)=@_;
+                    $redCastObj->log_debug(sprintf "got message from ptr#%s handler", refaddr($r));
                     $_->($message => $xtopic) for values do {
                         ($_=eval { $redCastObj->subscribers->{$xtopic} } and is_plain_hashref($_) and %{$_} and $_) or {}
                     };
@@ -384,26 +437,32 @@ sub new {
             'acl' => '-'        
         },
     );
-    
+    weaken($props{'redc'}{'val'});
     $redCastObj = bless sub {
         return unless my $method = shift;
-        $logger->logdie('No such method: ',$method) unless my $methodProps = $props{$method};
+        my $methodProps = $props{$method} 
+            or $logger->logdie('No such method: ', $method);
         my $callerPkg = scalar(caller($callerLvl == 1 ? 1 : 0));
         my $acl = $methodProps->{'acl'} // '-';
         unless ( ($callerPkg eq __PACKAGE__ or index($callerPkg, __PACKAGE__ . '::') == 0) or index($acl, @_ ? 'w' : 'r') >= 0 ) {
             $logger->logdie(sprintf 'Access control violation while calling <<%s>> method', $method);
         }
         my $errMsg;
-        return is_plain_coderef($methodProps->{'val'})
-                ? $methodProps->{'val'}->($redCastObj, @_)
-                : ($#_ >= 0)
-                    ? ($methodProps->{'check'} and !$methodProps->{'check'}->($_[0], $errMsg))
-                        ? $logger->logdie('Incorrect value passed to method ', $method, $errMsg ? (': ', $errMsg) : () )
-                        : do { $methodProps->{'val'} = shift }
-                    : $methodProps->{'val'};
+        # return this:
+        is_plain_coderef( $methodProps->{'val'} )
+        ? $methodProps->{'val'}->(
+              exists($methodProps->{'!slf'}) ? () : ($redCastObj),
+              @_
+          )
+        : ($#_ >= 0)
+            ? ($methodProps->{'check'} and !$methodProps->{'check'}->($_[0], $errMsg))
+                ? $logger->logdie('Incorrect value passed to method ', $method, $errMsg ? (': ', $errMsg) : () )
+                : do { $methodProps->{'val'} = shift }
+            : $methodProps->{'val'};
+            
     }, ( ref($class) || $class );
     $redCastObj->($_, $pars{$_}) for grep exists($props{$_}), keys %pars;
-    $redCastObj->redc->on('error' => $redCastObj->('on_error')->{'hndl'});
+    $redc->on('error' => $redCastObj->('on_error')->{'hndl'});
     $redCastObj->logger->debug(__PACKAGE__.' instance id=#'.refaddr($redCastObj).' is ready to use');
     return $redCastObj
 } # <- constructor aka NEW
@@ -418,29 +477,38 @@ sub publish {
         ? (undef, \$_[0])
         : ($_[0], \$_[1]);
     my $hndl_on_pub = $_[2];
-    
+    $slf->log_debug('in publish()');
     $topic or $slf->log_warn('Target channel was not defined, so publishing to "' . ($topic=DFLT_TOPIC()) . '"');    
     my $xtopic = $slf->__xtopic($topic);
     
     my $doAdd2UnPub = sub {
+        my $p_errMsg = $_[0];
         my $umi = $slf->add_unpub($umi, $xtopic, $refMsg);
-        $slf->log_warn(sprintf 'Failed to publish message <<%s>>{%s} on channel [%s]. It was appended to the deferred queue as UMI=%s. Reason of failure: <<%s>>', __cut(${$refMsg}), refaddr($refMsg), $xtopic, $umi, __cut(${$_[0]}));                    
+        $slf->log_warn(
+            sprintf 'Failed to publish message <<%s>>(ptr#%s) on channel [%s]. It was appended to the deferred queue as UMI=%s. Reason of failure: <<%s>>',
+                    __cut($refMsg), refaddr($refMsg), $xtopic, $umi, __cut($p_errMsg)
+        );
     };    
     
-    if ($slf->reconnecting) {
-        $doAdd2UnPub->(\'Reconnection is in progress');
+    if ($slf->reconnecting or $slf->has_unpublished) {
+        $doAdd2UnPub->($slf->reconnecting ? \'Reconnection is in progress' : \'"Unpublished" queue is not empty, your message was appended to the end of the unpub queue');
         return
     }
-    
     my $flAlreadyFired = 0;
     $slf->__ping_and_exec(
+        'name' => 'publisher',
         'exec' => sub {
-            $slf->redc->publish($xtopic => ${$refMsg}, $_[1])
+            my $delay_begin = $_[1];
+            if ($slf->reconnecting) {
+                $doAdd2UnPub->(\'Reconnection is in progress');
+            } else {
+                $slf->redc->publish($xtopic => ${$refMsg}, $delay_begin)
+            }
         },
         'on_ping_error' => sub {
             $slf->log_error('(pub) Redis ping error, will try to reconnect');
             $doAdd2UnPub->($_[1]);
-            $slf->reconnect;
+            $slf->reconnect unless $slf->reconnecting;
         },
         'on_exec_error' => sub {
             return if $flAlreadyFired++;
@@ -457,7 +525,7 @@ sub publish {
 
 sub subscribe {
 # $fl_opt_hndl_is_delbeg means "handle is delay->begin sub {}" :)
-    my ($slf, $topic, $hndl_on_msg, $opt_hndl_on_subs_status, $maybe_mojo_delay)=@_;
+    my ($slf, $topic, $hndl_on_msg, $opt_hndl_on_subs_status, $maybe_mojo_delay) = @_;
     my $xtopic=$slf->__xtopic($topic);
     my $log = $slf->logger;
     ( $hndl_on_msg and is_plain_coderef($hndl_on_msg) )
@@ -504,13 +572,14 @@ sub subscribe {
 
 sub AUTOLOAD {
     our $AUTOLOAD;
-    my $slf=$_[0];
+    my $slf = $_[0];
     
-    return unless my ($method)=$AUTOLOAD=~/::(\w+)$/;
+    my ($method) = $AUTOLOAD =~ /::(\w+)$/;
+    $method or $slf->log_logdie('No such method defined: ' . $method);
     
     no strict 'refs';
     *{$AUTOLOAD} = do {
-      $slf->('hasMethod'=>$method)
+      $slf->('has_method' => $method)
         ? sub {
             $callerLvl = 1;
             my $rslt = $_[0]->($method, @_[1..$#_]);
@@ -518,12 +587,16 @@ sub AUTOLOAD {
             return $rslt
           }
         : do {
-            if ( my $cr = $slf->('redc')->can($method) ) {
+            
+            my $redc = $slf->('redc');
+            if ( $redc and my $cr = $redc->can($method) ) {
                 sub { 
                     $cr->( $_[0]->('redc'), @_[1..$#_] )
                 }
-            } else {
+            } elsif ( $redc ) {
                 $slf->log_logdie(sprintf 'Method %s is not implemented by %s', $method, __PACKAGE__)
+            } else {
+                $slf->log_logdie(sprintf 'Method %s cant be interpreted as external: Redis connector not ready', $method)
             }
           }
     };
@@ -562,9 +635,15 @@ sub __check_logger {
 }
 
 sub __cut($) {
-    length($_[0]) <= MAX_MSG_LENGTH_TO_SHOW
-        ? $_[0]
-        : substr($_[0], 0, MAX_MSG_LENGTH_TO_SHOW - 3) . '...'
+    if (&is_plain_scalarref) {
+        length(${$_[0]}) <= MAX_MSG_LENGTH_TO_SHOW
+            ? ${$_[0]}
+            : substr(${$_[0]}, 0, MAX_MSG_LENGTH_TO_SHOW - 3) . '...'
+    } else {
+        length($_[0]) <= MAX_MSG_LENGTH_TO_SHOW
+            ? $_[0]
+            : substr($_[0], 0, MAX_MSG_LENGTH_TO_SHOW - 3) . '...'
+    }
 }
 
 sub __get_timer_settings {
@@ -584,7 +663,7 @@ sub __get_timer_settings {
             ( (!(defined and length) or ($c and !$_) ) and $_ = $dflt->[$c] ) or $_ += 0
         }
     }
-    \@afterANDperiod;    
+    \@afterANDperiod;
 }
 
 sub __set_timer {
@@ -617,7 +696,9 @@ sub __ping_and_exec {
                            return
                          }
             }
+            $slf->log_debug(($opt{'name'} // '<UNKNOWN>') . ' on ping_success()');
             $opt{'exec'}->($slf, $delay->begin);
+
         },
         is_plain_coderef( $opt{'handle_exec_result'} )
             ? $opt{'handle_exec_result'}
@@ -631,14 +712,15 @@ sub __ping_and_exec {
                     $opt{'on_success'}->($slf)
                 }
               }
+    )->then(
+        is_plain_coderef( $opt{'after_done'} ) ? $opt{'after_done'} : undef,
+        sub {
+            confess sprintf 'Error in evloop<<%s>>: %s', ($opt{'name'} // 'UNNAMED'), "@_";
+            $slf->log_logdie(sprintf 'Error in evloop<<%s>>: %s', ($opt{'name'} // 'UNNAMED'), "@_");
+#            $_->($slf, $_[1]) for grep is_plain_coderef($_), @opt{qw/on_ioloop_error on_finish/};
+        }
     );
-    $delayObj->on(
-        'error' => sub {
-            $slf->log_error(sprintf 'Error in evloop<<%s>>: %s', ($opt{'name'} // 'UNNAMED'), $_[1]);
-            $_->($slf, $_[1]) for grep is_plain_coderef($_), @opt{qw/on_ioloop_error on_finish/};
-        },
-        (is_plain_coderef($opt{'on_finish'}) ? ('finish' => $opt{'on_finish'}) : () ),
-    );
+    $delayObj = $delayObj->finally( $opt{'finally'} ) if is_plain_coderef( $opt{'finally'} );
     $delayObj
 }
 
@@ -651,14 +733,37 @@ sub __is_pos_number($) {
 }
 
 sub __is_boolean {
-    return unless !defined($_[0]) or (!ref($_[0]) and length($_[0]) and $_[0] =~ m/^(?:(?<TRUE>[+-]?[1-9][0-9]*|true|y(?:es)?|on)|(?<FALSE>0|false|no?|off))$/i);
+    return NO 
+        unless 
+            ! defined($_[0])
+                or
+            ( ! ref($_[0])
+                and
+              length($_[0])
+                and
+              $_[0] =~ m/^(?:(?<TRUE>[+-]?[1-9][0-9]*|true|y(?:es)?|on)|(?<FALSE>0|false|no?|off))$/i
+            );
     
     ${$_[1]} = 
         defined($_[0])
             ? defined($+{'TRUE'})
                 ? TRUE
                 : FALSE
-            : FALSE
+            : FALSE;
+    return YES;
+}
+
+1;
+
+package Redis::BCStation::Reconotify;
+use base 'Mojo::EventEmitter';
+
+sub we_are_reconnecting {
+    $_[0]->emit('reconnecting');
+}
+
+sub we_was_reconnected {
+    $_[0]->emit('reconnected' => $_[1]);
 }
 
 1;

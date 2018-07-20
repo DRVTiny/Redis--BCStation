@@ -97,7 +97,7 @@ sub new {
     my (%props, %aeh, %queUnPub, $redCastObj);
     
     my $redc = __redcon( $pars{'redis'} ) // $logger->logdie('Failed to establish connection to Redis');
-    
+    $redc->protocol_class('Protocol::Redis');
     my $tsStartRecon;
     my $reconot = Redis::BCStation::Reconotify->new;    
     $reconot->on('we_are_reconnecting' => sub { $tsStartRecon = time() });
@@ -115,6 +115,8 @@ sub new {
                                               or $slf->log_logdie('fast-but-binary-unsafe option value is incorrect (must be boolean)');
                                           if ( defined($flNewFastButUnsafe) xor defined($flFastButUnsafe) ) {
                                               $flFastButUnsafe = $flNewFastButUnsafe;
+                                              $flNewFastButUnsafe
+                                                  and $slf->log_warn('You are going to use unsafe protocol package that cant transmit any binary data including zero bytes. See Protocol::Redis::XS issues for more info.');
                                               $redc->protocol_class('Protocol::Redis' . ($flNewFastButUnsafe ? '::XS' : ''))
                                           }
                                           return DONE
@@ -455,7 +457,7 @@ sub new {
               @_
           )
         : ($#_ >= 0)
-            ? ($methodProps->{'check'} and !$methodProps->{'check'}->($_[0], $errMsg))
+            ? ($methodProps->{'chk'} and !$methodProps->{'chk'}->($_[0], $errMsg))
                 ? $logger->logdie('Incorrect value passed to method ', $method, $errMsg ? (': ', $errMsg) : () )
                 : do { $methodProps->{'val'} = shift }
             : $methodProps->{'val'};
@@ -630,7 +632,7 @@ sub __xtopic {
 
 sub __check_logger {
     shift while ref($_[0]) eq __PACKAGE__;
-    my $L=shift;
+    my $L = shift;
     return ($L and ref($L) and blessed($L) and !(grep !$L->can($_), qw/debug info warn error fatal logdie/))
 }
 
